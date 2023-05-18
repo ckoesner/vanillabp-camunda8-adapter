@@ -1,6 +1,9 @@
 package io.vanillabp.camunda8.deployment;
 
 import io.camunda.zeebe.client.ZeebeClient;
+import io.camunda.zeebe.client.api.ZeebeFuture;
+import io.camunda.zeebe.client.api.command.FinalCommandStep;
+import io.camunda.zeebe.client.api.response.DeploymentEvent;
 import io.camunda.zeebe.model.bpmn.impl.BpmnModelInstanceImpl;
 import io.camunda.zeebe.model.bpmn.impl.BpmnParser;
 import io.camunda.zeebe.model.bpmn.instance.BusinessRuleTask;
@@ -32,6 +35,7 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.stream.Collectors;
@@ -104,9 +108,9 @@ public class Camunda8DeploymentAdapter extends ModuleAwareBpmnDeployment {
 
         // Add all DMNs to deploy-command: on one hand to deploy them and on the
         // other hand to consider their hash code on calculating total package hash code
-        Arrays
+        final var dmnDeploymentCommands = Arrays
                 .stream(dmns)
-                .forEach(resource -> {
+                .map(resource -> {
                     try (var inputStream = new HashCodeInputStream(
                             resource.getInputStream(),
                             deploymentHashCode[0])) {
@@ -115,7 +119,7 @@ public class Camunda8DeploymentAdapter extends ModuleAwareBpmnDeployment {
                         
                         deploymentHashCode[0] = inputStream.getTotalHashCode();
                         
-                        deployResourceCommand.addResourceBytes(bytes, resource.getFilename());
+                        return deployResourceCommand.addResourceBytes(bytes, resource.getFilename());
                         
                     } catch (IOException e) {
                         throw new RuntimeException(e.getMessage());
@@ -124,11 +128,9 @@ public class Camunda8DeploymentAdapter extends ModuleAwareBpmnDeployment {
         
         final var deployedProcesses = new HashMap<String, DeployedBpmn>();
 
-        final boolean hasDeployables[] = { false };
-
         // Add all BPMNs to deploy-command: on one hand to deploy them and on the
         // other hand to wire them to the using project beans according to the SPI
-        final var deploymentCommand = Arrays
+        final var bpmnDeploymentCommands = Arrays
                 .stream(bpmns)
                 .map(resource -> {
                     try (var inputStream = new HashCodeInputStream(
@@ -147,35 +149,27 @@ public class Camunda8DeploymentAdapter extends ModuleAwareBpmnDeployment {
                         processBpmnModel(workflowModuleId, deployedProcesses, bpmn, model, false);
                         deploymentHashCode[0] = inputStream.getTotalHashCode();
 
-                        hasDeployables[0] = true;
-
                     	return deployResourceCommand.addProcessModel(model, resource.getFilename());
                     	
                     } catch (IOException e) {
                         throw new RuntimeException(e.getMessage());
                     }
-                })
-                .filter(Objects::nonNull)
-                .reduce((first, second) -> second);
-        
-        if (hasDeployables[0]) {
-            
-            final var deployedResources = deploymentCommand
-                    .map(command -> command.send().join())
-                    .orElseThrow();
-                    
-            // BPMNs which are part of the current package will stored
-            deployedResources
-                    .getProcesses()
-                    .stream()
-                    .map(process -> deploymentService.addProcess(
-                            deploymentHashCode[0],
-                            process,
-                            deployedProcesses.get(process.getBpmnProcessId())).getDefinitionKey())
-                    .collect(Collectors.toList());
-            
-        }
-        
+                });
+
+        Stream.concat(dmnDeploymentCommands, bpmnDeploymentCommands)
+              .filter(Objects::nonNull)
+              .reduce((first, second) -> second)
+              .map(FinalCommandStep::send)
+              .map(ZeebeFuture::join)
+              // BPMNs which are part of the current package will stored
+              .map(DeploymentEvent::getProcesses)
+              .stream()
+              .flatMap(List::stream)
+              .forEach(process -> deploymentService.addProcess(
+                      deploymentHashCode[0],
+                      process,
+                      deployedProcesses.get(process.getBpmnProcessId())));
+
         // BPMNs which were deployed in the past need to be forced to be parsed for wiring
         deploymentService
                 .getBpmnNotOfPackage(deploymentHashCode[0])
